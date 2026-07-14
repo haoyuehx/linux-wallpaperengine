@@ -8,9 +8,13 @@
 #include <cstdlib>
 #include <ranges>
 
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/extensions/XShm.h>
 #ifdef HAVE_XFIXES
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/shape.h>
@@ -66,8 +70,19 @@ void X11Output::free () {
 	}
 
 	if (this->m_image != nullptr) {
-	    // XDestroyImage owns and frees m_imageData.
-	    XDestroyImage (this->m_image);
+	    if (this->m_useShm) {
+		char* shmAddress = this->m_shmInfo.shmaddr;
+		XShmDetach (this->m_display, &this->m_shmInfo);
+		XSync (this->m_display, False);
+		// The shared segment is detached separately; never pass it to free().
+		this->m_image->data = nullptr;
+		XDestroyImage (this->m_image);
+		if (shmAddress != nullptr && shmAddress != reinterpret_cast<char*> (-1))
+		    shmdt (shmAddress);
+	    } else {
+		// XDestroyImage owns and frees m_imageData for the fallback image.
+		XDestroyImage (this->m_image);
+	    }
 	    this->m_image = nullptr;
 	    this->m_imageData = nullptr;
 	} else if (this->m_imageData != nullptr) {
@@ -93,6 +108,8 @@ void X11Output::free () {
     this->m_esetrootPixmapAtom = None;
     this->m_imageSize = 0;
     this->m_usePerOutputWindows = false;
+    this->m_useShm = false;
+    this->m_shmInfo = {};
     this->m_lastRootSync = {};
 }
 
@@ -330,6 +347,41 @@ void X11Output::initX11Background () {
 void X11Output::initImageBuffer (unsigned int depth) {
     const int screen = DefaultScreen (this->m_display);
 
+    if (XShmQueryExtension (this->m_display)) {
+	this->m_image = XShmCreateImage (
+	    this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, nullptr, &this->m_shmInfo,
+	    this->m_fullWidth, this->m_fullHeight
+	);
+	if (this->m_image != nullptr) {
+	    const size_t imageBytes = static_cast<size_t> (this->m_image->bytes_per_line) * this->m_image->height;
+	    this->m_shmInfo.shmid = shmget (IPC_PRIVATE, imageBytes, IPC_CREAT | 0600);
+	    if (this->m_shmInfo.shmid >= 0) {
+		this->m_shmInfo.shmaddr = static_cast<char*> (shmat (this->m_shmInfo.shmid, nullptr, 0));
+		if (this->m_shmInfo.shmaddr != reinterpret_cast<char*> (-1)) {
+		    this->m_shmInfo.readOnly = False;
+		    this->m_image->data = this->m_shmInfo.shmaddr;
+		    if (XShmAttach (this->m_display, &this->m_shmInfo)) {
+			XSync (this->m_display, False);
+			// Mark it for automatic removal after the final detach.
+			shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
+			this->m_useShm = true;
+			this->m_imageData = this->m_shmInfo.shmaddr;
+			this->m_imageSize = static_cast<uint32_t> (imageBytes);
+			std::fill_n (this->m_imageData, imageBytes, 0);
+			sLog.out ("Using MIT-SHM for X11 frame uploads (", imageBytes, " bytes)");
+			return;
+		    }
+		    shmdt (this->m_shmInfo.shmaddr);
+		}
+		shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
+	    }
+	    this->m_image->data = nullptr;
+	    XDestroyImage (this->m_image);
+	    this->m_image = nullptr;
+	    this->m_shmInfo = {};
+	}
+    }
+
     this->m_imageSize = static_cast<uint32_t> (this->m_fullWidth) * static_cast<uint32_t> (this->m_fullHeight) * 4;
     this->m_imageData = static_cast<char*> (std::calloc (this->m_imageSize, 1));
     if (this->m_imageData == nullptr)
@@ -342,6 +394,7 @@ void X11Output::initImageBuffer (unsigned int depth) {
     if (this->m_image == nullptr)
 	sLog.exception ("Cannot create the X11 image");
 
+    sLog.out ("MIT-SHM unavailable; using regular X11 frame uploads");
 }
 
 void X11Output::initPerOutputWindows () {
@@ -398,9 +451,17 @@ void X11Output::updateRender () const {
 	Drawable drawable, GC gc, int sourceX, int sourceY, int destinationX, int destinationY, unsigned int width,
 	unsigned int height
     ) {
-	XPutImage (
-	    this->m_display, drawable, gc, this->m_image, sourceX, sourceY, destinationX, destinationY, width, height
-	);
+	if (this->m_useShm) {
+	    XShmPutImage (
+		this->m_display, drawable, gc, this->m_image, sourceX, sourceY, destinationX, destinationY, width,
+		height, False
+	    );
+	} else {
+	    XPutImage (
+		this->m_display, drawable, gc, this->m_image, sourceX, sourceY, destinationX, destinationY, width,
+		height
+	    );
+	}
     };
 
     if (this->m_usePerOutputWindows) {
@@ -448,5 +509,10 @@ void X11Output::updateRender () const {
 	this->m_lastRootSync = now;
     }
 
-    XFlush (this->m_display);
+    // The renderer overwrites this buffer on the next frame, so ensure the X
+    // server has finished consuming shared-memory uploads before returning.
+    if (this->m_useShm)
+	XSync (this->m_display, False);
+    else
+	XFlush (this->m_display);
 }

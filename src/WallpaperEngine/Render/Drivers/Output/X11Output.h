@@ -7,6 +7,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/extensions/XShm.h>
 
 #include "Output.h"
 #include "WallpaperEngine/Render/Drivers/VideoDriver.h"
@@ -46,6 +47,8 @@ private:
     int m_rootOffsetX = 0;
     int m_rootOffsetY = 0;
     bool m_usePerOutputWindows = false;
+    bool m_useShm = false;
+    mutable XShmSegmentInfo m_shmInfo = {};
     mutable std::chrono::steady_clock::time_point m_lastRootSync = {};
     std::map<std::string, Window> m_windows = {};
     std::map<std::string, GC> m_windowGCs = {};
