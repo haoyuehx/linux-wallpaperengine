@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <glm/vec4.hpp>
 #include <map>
 #include <string>
@@ -30,12 +31,24 @@ private:
     void discoverOutputs (XRRScreenResources* screenResources);
     void validateOutputs () const;
     void initX11Background ();
+    void initImageBuffer (unsigned int depth);
+    void initPerOutputWindows ();
     void free ();
 
     Display* m_display = nullptr;
-    Pixmap m_pixmap;
-    Window m_root;
-    GC m_gc;
+    Pixmap m_pixmap = None;
+    Window m_root = None;
+    GC m_gc = None;
+    Atom m_rootPixmapAtom = None;
+    Atom m_esetrootPixmapAtom = None;
+    int m_rootWidth = 0;
+    int m_rootHeight = 0;
+    int m_rootOffsetX = 0;
+    int m_rootOffsetY = 0;
+    bool m_usePerOutputWindows = false;
+    mutable std::chrono::steady_clock::time_point m_lastRootSync = {};
+    std::map<std::string, Window> m_windows = {};
+    std::map<std::string, GC> m_windowGCs = {};
     char* m_imageData = nullptr;
     uint32_t m_imageSize = 0;
     XImage* m_image = nullptr;
