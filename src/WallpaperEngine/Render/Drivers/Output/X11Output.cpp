@@ -29,7 +29,9 @@ thread_local bool trappedXError = false;
 
 bool supportsBGRAReadback (const XImage* image, int width) {
     return image != nullptr && image->bits_per_pixel == 32
-	&& image->bytes_per_line == static_cast<long> (width) * 4;
+	&& image->bytes_per_line == static_cast<long> (width) * 4 && image->byte_order == LSBFirst
+	&& image->red_mask == 0x00FF0000UL && image->green_mask == 0x0000FF00UL
+	&& image->blue_mask == 0x000000FFUL;
 }
 
 uint32_t checkedImageSize (const XImage* image) {
@@ -414,7 +416,9 @@ bool X11Output::initShmImageBuffer (unsigned int depth) {
     if (!supportsBGRAReadback (this->m_image, this->m_fullWidth)) {
 	sLog.error (
 	    "MIT-SHM image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
-	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
+	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line, byte order ",
+	    this->m_image->byte_order, ", RGB masks ", this->m_image->red_mask, "/", this->m_image->green_mask,
+	    "/", this->m_image->blue_mask, ")"
 	);
 	this->discardShmImageBuffer ();
 	return false;
@@ -482,7 +486,9 @@ void X11Output::initFallbackImageBuffer (unsigned int depth) {
     if (!supportsBGRAReadback (this->m_image, this->m_fullWidth))
 	sLog.exception (
 	    "X11 image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
-	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
+	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line, byte order ",
+	    this->m_image->byte_order, ", RGB masks ", this->m_image->red_mask, "/", this->m_image->green_mask,
+	    "/", this->m_image->blue_mask, ")"
 	);
 
     this->m_imageSize = checkedImageSize (this->m_image);
