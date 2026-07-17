@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <ranges>
 
 #include <sys/ipc.h>
@@ -22,6 +23,16 @@
 
 using namespace WallpaperEngine::Render::Drivers::Output;
 
+namespace {
+thread_local bool trapXErrors = false;
+thread_local bool trappedXError = false;
+
+bool supportsBGRAReadback (const XImage* image, int width) {
+    return image != nullptr && image->bits_per_pixel == 32
+	&& image->bytes_per_line == static_cast<long> (width) * 4;
+}
+} // namespace
+
 void CustomXIOErrorExitHandler (Display*, void* userdata) {
     const auto context = static_cast<X11Output*> (userdata);
     sLog.debugerror ("Critical XServer error detected. Attempting to recover...");
@@ -29,6 +40,11 @@ void CustomXIOErrorExitHandler (Display*, void* userdata) {
 }
 
 int CustomXErrorHandler (Display*, XErrorEvent*) {
+    if (trapXErrors) {
+	trappedXError = true;
+	return 0;
+    }
+
     sLog.debugerror ("Detected X error");
     return 0;
 }
@@ -92,8 +108,18 @@ void X11Output::free () {
 
 	if (this->m_gc != None)
 	    XFreeGC (this->m_display, this->m_gc);
-	if (this->m_pixmap != None)
+	if (this->m_pixmap != None) {
+	    // The root properties must never retain the XID after its pixmap is freed.
+	    XSetWindowBackground (
+		this->m_display, this->m_root, BlackPixel (this->m_display, DefaultScreen (this->m_display))
+	    );
+	    if (this->m_rootPixmapAtom != None)
+		XDeleteProperty (this->m_display, this->m_root, this->m_rootPixmapAtom);
+	    if (this->m_esetrootPixmapAtom != None)
+		XDeleteProperty (this->m_display, this->m_root, this->m_esetrootPixmapAtom);
+	    XClearWindow (this->m_display, this->m_root);
 	    XFreePixmap (this->m_display, this->m_pixmap);
+	}
 
 	XCloseDisplay (this->m_display);
     }
@@ -353,15 +379,31 @@ void X11Output::initImageBuffer (unsigned int depth) {
 	    this->m_fullWidth, this->m_fullHeight
 	);
 	if (this->m_image != nullptr) {
+	    if (!supportsBGRAReadback (this->m_image, this->m_fullWidth)) {
+		sLog.error (
+		    "MIT-SHM image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
+		    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
+		);
+		XDestroyImage (this->m_image);
+		this->m_image = nullptr;
+	    }
+	}
+	if (this->m_image != nullptr) {
 	    const size_t imageBytes = static_cast<size_t> (this->m_image->bytes_per_line) * this->m_image->height;
+	    if (imageBytes > std::numeric_limits<uint32_t>::max ())
+		sLog.exception ("X11 composition image exceeds the supported buffer size");
 	    this->m_shmInfo.shmid = shmget (IPC_PRIVATE, imageBytes, IPC_CREAT | 0600);
 	    if (this->m_shmInfo.shmid >= 0) {
 		this->m_shmInfo.shmaddr = static_cast<char*> (shmat (this->m_shmInfo.shmid, nullptr, 0));
 		if (this->m_shmInfo.shmaddr != reinterpret_cast<char*> (-1)) {
 		    this->m_shmInfo.readOnly = False;
 		    this->m_image->data = this->m_shmInfo.shmaddr;
-		    if (XShmAttach (this->m_display, &this->m_shmInfo)) {
-			XSync (this->m_display, False);
+		    trappedXError = false;
+		    trapXErrors = true;
+		    const bool attachRequested = XShmAttach (this->m_display, &this->m_shmInfo);
+		    XSync (this->m_display, False);
+		    trapXErrors = false;
+		    if (attachRequested && !trappedXError) {
 			// Mark it for automatic removal after the final detach.
 			shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
 			this->m_useShm = true;
@@ -371,6 +413,8 @@ void X11Output::initImageBuffer (unsigned int depth) {
 			sLog.out ("Using MIT-SHM for X11 frame uploads (", imageBytes, " bytes)");
 			return;
 		    }
+		    if (attachRequested && trappedXError)
+			sLog.error ("X server rejected MIT-SHM attachment; using regular X11 frame uploads");
 		    shmdt (this->m_shmInfo.shmaddr);
 		}
 		shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
@@ -382,17 +426,26 @@ void X11Output::initImageBuffer (unsigned int depth) {
 	}
     }
 
-    this->m_imageSize = static_cast<uint32_t> (this->m_fullWidth) * static_cast<uint32_t> (this->m_fullHeight) * 4;
-    this->m_imageData = static_cast<char*> (std::calloc (this->m_imageSize, 1));
-    if (this->m_imageData == nullptr)
-	sLog.exception ("Cannot allocate the X11 image buffer");
-
     this->m_image = XCreateImage (
-	this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, 0, this->m_imageData,
+	this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, 0, nullptr,
 	this->m_fullWidth, this->m_fullHeight, 32, 0
     );
     if (this->m_image == nullptr)
 	sLog.exception ("Cannot create the X11 image");
+    if (!supportsBGRAReadback (this->m_image, this->m_fullWidth))
+	sLog.exception (
+	    "X11 image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
+	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
+	);
+
+    const size_t imageBytes = static_cast<size_t> (this->m_image->bytes_per_line) * this->m_image->height;
+    if (imageBytes > std::numeric_limits<uint32_t>::max ())
+	sLog.exception ("X11 composition image exceeds the supported buffer size");
+    this->m_imageSize = static_cast<uint32_t> (imageBytes);
+    this->m_imageData = static_cast<char*> (std::calloc (imageBytes, 1));
+    if (this->m_imageData == nullptr)
+	sLog.exception ("Cannot allocate the X11 image buffer");
+    this->m_image->data = this->m_imageData;
 
     sLog.out ("MIT-SHM unavailable; using regular X11 frame uploads");
 }
