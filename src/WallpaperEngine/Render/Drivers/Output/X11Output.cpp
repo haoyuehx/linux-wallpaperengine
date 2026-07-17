@@ -31,6 +31,13 @@ bool supportsBGRAReadback (const XImage* image, int width) {
     return image != nullptr && image->bits_per_pixel == 32
 	&& image->bytes_per_line == static_cast<long> (width) * 4;
 }
+
+uint32_t checkedImageSize (const XImage* image) {
+    const size_t imageBytes = static_cast<size_t> (image->bytes_per_line) * image->height;
+    if (imageBytes > std::numeric_limits<uint32_t>::max ())
+	sLog.exception ("X11 composition image exceeds the supported buffer size");
+    return static_cast<uint32_t> (imageBytes);
+}
 } // namespace
 
 void CustomXIOErrorExitHandler (Display*, void*) {
@@ -76,52 +83,9 @@ void X11Output::free () {
     this->m_viewports.clear ();
 
     if (this->m_display != nullptr) {
-	for (const auto& [name, gc] : this->m_windowGCs) {
-	    if (gc != None)
-		XFreeGC (this->m_display, gc);
-	}
-
-	for (const auto& [name, window] : this->m_windows) {
-	    if (window != None)
-		XDestroyWindow (this->m_display, window);
-	}
-
-	if (this->m_image != nullptr) {
-	    if (this->m_useShm) {
-		char* shmAddress = this->m_shmInfo.shmaddr;
-		XShmDetach (this->m_display, &this->m_shmInfo);
-		XSync (this->m_display, False);
-		// The shared segment is detached separately; never pass it to free().
-		this->m_image->data = nullptr;
-		XDestroyImage (this->m_image);
-		if (shmAddress != nullptr && shmAddress != reinterpret_cast<char*> (-1))
-		    shmdt (shmAddress);
-	    } else {
-		// XDestroyImage owns and frees m_imageData for the fallback image.
-		XDestroyImage (this->m_image);
-	    }
-	    this->m_image = nullptr;
-	    this->m_imageData = nullptr;
-	} else if (this->m_imageData != nullptr) {
-	    std::free (this->m_imageData);
-	    this->m_imageData = nullptr;
-	}
-
-	if (this->m_gc != None)
-	    XFreeGC (this->m_display, this->m_gc);
-	if (this->m_pixmap != None) {
-	    // The root properties must never retain the XID after its pixmap is freed.
-	    XSetWindowBackground (
-		this->m_display, this->m_root, BlackPixel (this->m_display, DefaultScreen (this->m_display))
-	    );
-	    if (this->m_rootPixmapAtom != None)
-		XDeleteProperty (this->m_display, this->m_root, this->m_rootPixmapAtom);
-	    if (this->m_esetrootPixmapAtom != None)
-		XDeleteProperty (this->m_display, this->m_root, this->m_esetrootPixmapAtom);
-	    XClearWindow (this->m_display, this->m_root);
-	    XFreePixmap (this->m_display, this->m_pixmap);
-	}
-
+	this->freePerOutputWindows ();
+	this->freeImageBuffer ();
+	this->freeRootPixmap ();
 	XCloseDisplay (this->m_display);
     }
 
@@ -138,6 +102,61 @@ void X11Output::free () {
     this->m_useShm = false;
     this->m_shmInfo = {};
     this->m_lastRootSync = {};
+}
+
+void X11Output::freePerOutputWindows () {
+    for (const auto& [name, gc] : this->m_windowGCs) {
+	if (gc != None)
+	    XFreeGC (this->m_display, gc);
+    }
+
+    for (const auto& [name, window] : this->m_windows) {
+	if (window != None)
+	    XDestroyWindow (this->m_display, window);
+    }
+}
+
+void X11Output::freeImageBuffer () {
+    if (this->m_image == nullptr) {
+	std::free (this->m_imageData);
+	this->m_imageData = nullptr;
+	return;
+    }
+
+    if (this->m_useShm) {
+	char* shmAddress = this->m_shmInfo.shmaddr;
+	XShmDetach (this->m_display, &this->m_shmInfo);
+	XSync (this->m_display, False);
+	// The shared segment is detached separately; never pass it to free().
+	this->m_image->data = nullptr;
+	XDestroyImage (this->m_image);
+	if (shmAddress != nullptr && shmAddress != reinterpret_cast<char*> (-1))
+	    shmdt (shmAddress);
+    } else {
+	// XDestroyImage owns and frees m_imageData for the fallback image.
+	XDestroyImage (this->m_image);
+    }
+
+    this->m_image = nullptr;
+    this->m_imageData = nullptr;
+}
+
+void X11Output::freeRootPixmap () {
+    if (this->m_gc != None)
+	XFreeGC (this->m_display, this->m_gc);
+    if (this->m_pixmap == None)
+	return;
+
+    // The root properties must never retain the XID after its pixmap is freed.
+    XSetWindowBackground (
+	this->m_display, this->m_root, BlackPixel (this->m_display, DefaultScreen (this->m_display))
+    );
+    if (this->m_rootPixmapAtom != None)
+	XDeleteProperty (this->m_display, this->m_root, this->m_rootPixmapAtom);
+    if (this->m_esetrootPixmapAtom != None)
+	XDeleteProperty (this->m_display, this->m_root, this->m_esetrootPixmapAtom);
+    XClearWindow (this->m_display, this->m_root);
+    XFreePixmap (this->m_display, this->m_pixmap);
 }
 
 void* X11Output::getImageBuffer () const { return this->m_imageData; }
@@ -372,61 +391,88 @@ void X11Output::initX11Background () {
 }
 
 void X11Output::initImageBuffer (unsigned int depth) {
-    const int screen = DefaultScreen (this->m_display);
+    if (this->initShmImageBuffer (depth))
+	return;
 
-    if (XShmQueryExtension (this->m_display)) {
-	this->m_image = XShmCreateImage (
-	    this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, nullptr, &this->m_shmInfo,
-	    this->m_fullWidth, this->m_fullHeight
+    this->initFallbackImageBuffer (depth);
+}
+
+bool X11Output::initShmImageBuffer (unsigned int depth) {
+    if (!XShmQueryExtension (this->m_display))
+	return false;
+
+    const int screen = DefaultScreen (this->m_display);
+    this->m_shmInfo = {};
+    this->m_shmInfo.shmid = -1;
+    this->m_image = XShmCreateImage (
+	this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, nullptr, &this->m_shmInfo,
+	this->m_fullWidth, this->m_fullHeight
+    );
+    if (this->m_image == nullptr)
+	return false;
+
+    if (!supportsBGRAReadback (this->m_image, this->m_fullWidth)) {
+	sLog.error (
+	    "MIT-SHM image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
+	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
 	);
-	if (this->m_image != nullptr) {
-	    if (!supportsBGRAReadback (this->m_image, this->m_fullWidth)) {
-		sLog.error (
-		    "MIT-SHM image layout is incompatible with BGRA readback (", this->m_image->bits_per_pixel,
-		    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
-		);
-		XDestroyImage (this->m_image);
-		this->m_image = nullptr;
-	    }
-	}
-	if (this->m_image != nullptr) {
-	    const size_t imageBytes = static_cast<size_t> (this->m_image->bytes_per_line) * this->m_image->height;
-	    if (imageBytes > std::numeric_limits<uint32_t>::max ())
-		sLog.exception ("X11 composition image exceeds the supported buffer size");
-	    this->m_shmInfo.shmid = shmget (IPC_PRIVATE, imageBytes, IPC_CREAT | 0600);
-	    if (this->m_shmInfo.shmid >= 0) {
-		this->m_shmInfo.shmaddr = static_cast<char*> (shmat (this->m_shmInfo.shmid, nullptr, 0));
-		if (this->m_shmInfo.shmaddr != reinterpret_cast<char*> (-1)) {
-		    this->m_shmInfo.readOnly = False;
-		    this->m_image->data = this->m_shmInfo.shmaddr;
-		    trappedXError = false;
-		    trapXErrors = true;
-		    const bool attachRequested = XShmAttach (this->m_display, &this->m_shmInfo);
-		    XSync (this->m_display, False);
-		    trapXErrors = false;
-		    if (attachRequested && !trappedXError) {
-			// Mark it for automatic removal after the final detach.
-			shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
-			this->m_useShm = true;
-			this->m_imageData = this->m_shmInfo.shmaddr;
-			this->m_imageSize = static_cast<uint32_t> (imageBytes);
-			std::fill_n (this->m_imageData, imageBytes, 0);
-			sLog.out ("Using MIT-SHM for X11 frame uploads (", imageBytes, " bytes)");
-			return;
-		    }
-		    if (attachRequested && trappedXError)
-			sLog.error ("X server rejected MIT-SHM attachment; using regular X11 frame uploads");
-		    shmdt (this->m_shmInfo.shmaddr);
-		}
-		shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
-	    }
-	    this->m_image->data = nullptr;
-	    XDestroyImage (this->m_image);
-	    this->m_image = nullptr;
-	    this->m_shmInfo = {};
-	}
+	this->discardShmImageBuffer ();
+	return false;
     }
 
+    const uint32_t imageBytes = checkedImageSize (this->m_image);
+    this->m_shmInfo.shmid = shmget (IPC_PRIVATE, imageBytes, IPC_CREAT | 0600);
+    if (this->m_shmInfo.shmid < 0) {
+	this->discardShmImageBuffer ();
+	return false;
+    }
+
+    this->m_shmInfo.shmaddr = static_cast<char*> (shmat (this->m_shmInfo.shmid, nullptr, 0));
+    if (this->m_shmInfo.shmaddr == reinterpret_cast<char*> (-1)) {
+	this->discardShmImageBuffer ();
+	return false;
+    }
+
+    this->m_shmInfo.readOnly = False;
+    this->m_image->data = this->m_shmInfo.shmaddr;
+    trappedXError = false;
+    trapXErrors = true;
+    const bool attachRequested = XShmAttach (this->m_display, &this->m_shmInfo);
+    XSync (this->m_display, False);
+    trapXErrors = false;
+
+    if (!attachRequested || trappedXError) {
+	if (attachRequested)
+	    sLog.error ("X server rejected MIT-SHM attachment; using regular X11 frame uploads");
+	this->discardShmImageBuffer ();
+	return false;
+    }
+
+    // Mark it for automatic removal after the final detach.
+    shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
+    this->m_useShm = true;
+    this->m_imageData = this->m_shmInfo.shmaddr;
+    this->m_imageSize = imageBytes;
+    std::fill_n (this->m_imageData, imageBytes, 0);
+    sLog.out ("Using MIT-SHM for X11 frame uploads (", imageBytes, " bytes)");
+    return true;
+}
+
+void X11Output::discardShmImageBuffer () {
+    if (this->m_shmInfo.shmaddr != nullptr && this->m_shmInfo.shmaddr != reinterpret_cast<char*> (-1))
+	shmdt (this->m_shmInfo.shmaddr);
+    if (this->m_shmInfo.shmid >= 0)
+	shmctl (this->m_shmInfo.shmid, IPC_RMID, nullptr);
+    if (this->m_image != nullptr) {
+	this->m_image->data = nullptr;
+	XDestroyImage (this->m_image);
+	this->m_image = nullptr;
+    }
+    this->m_shmInfo = {};
+}
+
+void X11Output::initFallbackImageBuffer (unsigned int depth) {
+    const int screen = DefaultScreen (this->m_display);
     this->m_image = XCreateImage (
 	this->m_display, DefaultVisual (this->m_display, screen), depth, ZPixmap, 0, nullptr,
 	this->m_fullWidth, this->m_fullHeight, 32, 0
@@ -439,11 +485,8 @@ void X11Output::initImageBuffer (unsigned int depth) {
 	    " bits per pixel, ", this->m_image->bytes_per_line, " bytes per line)"
 	);
 
-    const size_t imageBytes = static_cast<size_t> (this->m_image->bytes_per_line) * this->m_image->height;
-    if (imageBytes > std::numeric_limits<uint32_t>::max ())
-	sLog.exception ("X11 composition image exceeds the supported buffer size");
-    this->m_imageSize = static_cast<uint32_t> (imageBytes);
-    this->m_imageData = static_cast<char*> (std::calloc (imageBytes, 1));
+    this->m_imageSize = checkedImageSize (this->m_image);
+    this->m_imageData = static_cast<char*> (std::calloc (this->m_imageSize, 1));
     if (this->m_imageData == nullptr)
 	sLog.exception ("Cannot allocate the X11 image buffer");
     this->m_image->data = this->m_imageData;

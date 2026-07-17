@@ -33,7 +33,13 @@ private:
     void validateOutputs () const;
     void initX11Background ();
     void initImageBuffer (unsigned int depth);
+    bool initShmImageBuffer (unsigned int depth);
+    void initFallbackImageBuffer (unsigned int depth);
     void initPerOutputWindows ();
+    void freePerOutputWindows ();
+    void freeImageBuffer ();
+    void freeRootPixmap ();
+    void discardShmImageBuffer ();
     void free ();
 
     Display* m_display = nullptr;
