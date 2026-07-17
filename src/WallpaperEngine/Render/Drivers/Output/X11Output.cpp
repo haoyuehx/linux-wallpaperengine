@@ -33,10 +33,11 @@ bool supportsBGRAReadback (const XImage* image, int width) {
 }
 } // namespace
 
-void CustomXIOErrorExitHandler (Display*, void* userdata) {
-    const auto context = static_cast<X11Output*> (userdata);
-    sLog.debugerror ("Critical XServer error detected. Attempting to recover...");
-    context->reset ();
+void CustomXIOErrorExitHandler (Display*, void*) {
+    // Xlib invokes this immediately before terminating after a connection loss.
+    // The Display is already unusable, so attempting teardown or recovery here
+    // would only issue more requests on the failed connection.
+    sLog.debugerror ("Critical X server connection error detected; exiting");
 }
 
 int CustomXErrorHandler (Display*, XErrorEvent*) {
